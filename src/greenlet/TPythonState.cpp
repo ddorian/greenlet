@@ -192,6 +192,19 @@ void PythonState::operator<<(const PyThreadState *const tstate) noexcept
     // ``greenlet.tests.test_greenlet_trash`` tries, but under 3.14,
     // at least, fails to do so.
     this->delete_later = Py_XNewRef(tstate->delete_later);
+#ifdef Py_GIL_DISABLED
+    // Switching greenlets swaps C stacks, which to the free-threaded runtime is
+    // the same predicament as detaching the thread: the PyCriticalSection nodes
+    // chained off tstate->critical_section live on the stack we're leaving, and
+    // their PyMutexes would stay locked behind our back. The greenlet we switch
+    // to could then block forever taking one of those same locks -- e.g. an
+    // asyncio event dispatched onto another fiber re-enters a Task/Future that
+    // the suspended fiber is mid-step on. So drop the locks here the way
+    // _PyThreadState_Detach() does and let operator>> re-take them on resume.
+    if (tstate->critical_section != 0) {
+        _PyCriticalSection_SuspendAll(const_cast<PyThreadState*>(tstate));
+    }
+#endif
     this->critical_section = tstate->critical_section;
   #elif GREENLET_PY312
     this->trash_delete_nesting = tstate->trash.delete_nesting;
@@ -301,6 +314,16 @@ void PythonState::operator>>(PyThreadState *const tstate) noexcept
         Py_CLEAR(this->delete_later);
     }
     tstate->critical_section = this->critical_section;
+#ifdef Py_GIL_DISABLED
+    // Re-acquire whatever operator<< suspended when this greenlet last yielded.
+    // A no-op for a greenlet that held no locks, and for a brand-new one whose
+    // chain starts empty. Mirrors the resume in _PyThreadState_Attach(); note
+    // _PyCriticalSection_Resume() dereferences the head, so the != 0 guard is
+    // load-bearing, not just a fast path.
+    if (tstate->critical_section != 0) {
+        _PyCriticalSection_Resume(tstate);
+    }
+#endif
 
   #elif GREENLET_PY312
     tstate->trash.delete_nesting = this->trash_delete_nesting;

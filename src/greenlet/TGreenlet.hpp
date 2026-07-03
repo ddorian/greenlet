@@ -39,6 +39,7 @@ using greenlet::refs::BorrowedGreenlet;
 #endif
 #ifdef Py_GIL_DISABLED
 #   include "internal/pycore_tstate.h"
+#   include "internal/pycore_critical_section.h"
 #endif
 #endif
 

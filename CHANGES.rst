@@ -16,6 +16,15 @@
   starts with an empty C-stack-reference list, just like a brand-new
   thread. See `issue 515
   <https://github.com/python-greenlet/greenlet/issues/515>`_.
+- Fix a deadlock on free-threaded builds when a greenlet switch happened
+  while a ``PyCriticalSection`` was held -- for example inside asyncio's
+  ``Task.__step``, which holds one on the running task for the duration of
+  the step. Because a switch swaps C stacks, the locks stayed held on the
+  greenlet we left, so the greenlet we switched to blocked forever trying to
+  take one of them. greenlet now suspends a thread's critical sections when
+  switching away and resumes them when switching back, the same way the
+  interpreter does when a thread detaches and reattaches. This is what caused
+  Playwright's synchronous API to hang under free-threading.
 
 
 3.5.3 (2026-06-26)
