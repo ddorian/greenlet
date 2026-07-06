@@ -8,6 +8,7 @@
 #include <Python.h>
 
 #include <atomic>
+#include <vector>
 
 #include "greenlet_compiler_compat.hpp"
 #include "greenlet_refs.hpp"
@@ -145,8 +146,7 @@ namespace greenlet
         // can keep them alive for the free-threaded GC (capture_c_stack_refs
         // explains why we snapshot rather than walk the list). Empty while we
         // run.
-        PyObject** c_stack_ref_snapshot;
-        Py_ssize_t c_stack_ref_snapshot_len;
+        std::vector<OwnedObject> c_stack_ref_snapshot;
     #endif
 #elif GREENLET_PY312
         int py_recursion_depth;
@@ -182,15 +182,13 @@ namespace greenlet
         // Take a strong reference to every object held by tstate's _PyCStackRef
         // list into c_stack_ref_snapshot so tp_traverse can keep them alive
         // while we're suspended. Must run while our C stack is still live
-        // (operator<<). clear_c_stack_ref_snapshot() drops those references.
+        // (operator<<). The snapshot is dropped by clear()ing the vector.
         void capture_c_stack_refs(const PyThreadState* tstate) noexcept;
-        void clear_c_stack_ref_snapshot() noexcept;
 #endif
 
     public:
 
         PythonState();
-        ~PythonState();
         // You can use this for testing whether we have a frame
         // or not. It returns const so they can't modify it.
         const OwnedFrame& top_frame() const noexcept;

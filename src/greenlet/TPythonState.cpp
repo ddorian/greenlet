@@ -18,8 +18,6 @@ PythonState::PythonState()
     ,stackpointer(nullptr)
     #ifdef Py_GIL_DISABLED
     ,c_stack_refs(nullptr)
-    ,c_stack_ref_snapshot(nullptr)
-    ,c_stack_ref_snapshot_len(0)
     #endif
 #elif GREENLET_PY312
     ,py_recursion_depth(0)
@@ -94,13 +92,6 @@ PythonState::PythonState()
 #endif
 }
 
-PythonState::~PythonState()
-{
-#if GREENLET_PY314 && defined(Py_GIL_DISABLED)
-    this->clear_c_stack_ref_snapshot();
-#endif
-}
-
 #if GREENLET_PY314 && defined(Py_GIL_DISABLED)
 void PythonState::capture_c_stack_refs(const PyThreadState* tstate) noexcept
 {
@@ -108,51 +99,20 @@ void PythonState::capture_c_stack_refs(const PyThreadState* tstate) noexcept
     // can walk tstate's _PyCStackRef list and take a strong reference to every
     // object it holds. tp_traverse visits these once we're suspended, because
     // by then the nodes themselves have been relocated into the heap stack copy
-    // and the saved list head no longer points at them. Ordinary strong
-    // references (not _Py_VISIT_STACKREF) because _PyGC_VisitStackRef isn't
-    // exported before 3.15, and a raw array rather than a Python container
-    // because operator<< must not allocate a GC-tracked object mid-switch.
-    // Reallocated from scratch each time; the list is empty at a typical
-    // switch, so this is usually just the count == 0 early return.
-    this->clear_c_stack_ref_snapshot();
-
-    const _PyCStackRef* const head = ((_PyThreadStateImpl*)tstate)->c_stack_refs;
-    Py_ssize_t count = 0;
-    for (const _PyCStackRef* node = head; node != nullptr; node = node->next) {
+    // and the saved list head no longer points at them. Strong references (not
+    // _Py_VISIT_STACKREF, whose _PyGC_VisitStackRef isn't exported before 3.15);
+    // a std::vector rather than a Python list/tuple because operator<< must not
+    // allocate a GC-tracked object mid-switch. Rebuilt from scratch each time;
+    // the list is empty at a typical switch, so this is usually just an empty
+    // loop.
+    this->c_stack_ref_snapshot.clear();
+    for (const _PyCStackRef* node = ((_PyThreadStateImpl*)tstate)->c_stack_refs;
+         node != nullptr; node = node->next) {
         if (!PyStackRef_IsNullOrInt(node->ref)) {
-            count++;
+            this->c_stack_ref_snapshot.push_back(
+                OwnedObject::owning(PyStackRef_AsPyObjectBorrow(node->ref)));
         }
     }
-    if (count == 0) {
-        return;
-    }
-    PyObject** buf = (PyObject**)PyMem_Malloc(count * sizeof(PyObject*));
-    if (buf == nullptr) {
-        // Out of memory mid-switch. Leaving the snapshot empty only forgoes the
-        // extra GC protection (i.e. the pre-fix behavior); we make nothing
-        // worse, and the switch will fail for the same reason a moment later.
-        return;
-    }
-    Py_ssize_t i = 0;
-    for (const _PyCStackRef* node = head; node != nullptr; node = node->next) {
-        if (!PyStackRef_IsNullOrInt(node->ref)) {
-            PyObject* obj = PyStackRef_AsPyObjectBorrow(node->ref);
-            Py_INCREF(obj);
-            buf[i++] = obj;
-        }
-    }
-    this->c_stack_ref_snapshot = buf;
-    this->c_stack_ref_snapshot_len = count;
-}
-
-void PythonState::clear_c_stack_ref_snapshot() noexcept
-{
-    for (Py_ssize_t i = 0; i < this->c_stack_ref_snapshot_len; i++) {
-        Py_DECREF(this->c_stack_ref_snapshot[i]);
-    }
-    PyMem_Free(this->c_stack_ref_snapshot);
-    this->c_stack_ref_snapshot = nullptr;
-    this->c_stack_ref_snapshot_len = 0;
 }
 #endif
 
@@ -335,7 +295,7 @@ void PythonState::operator>>(PyThreadState *const tstate) noexcept
     // We're the running greenlet again: our C-stack refs live in the thread
     // state now and gc_visit_thread_stacks() covers them, so drop the strong
     // references tp_traverse held on our behalf while we were suspended.
-    this->clear_c_stack_ref_snapshot();
+    this->c_stack_ref_snapshot.clear();
     #endif
     this->unexpose_frames();
   #elif GREENLET_PY312
@@ -490,10 +450,10 @@ int PythonState::tp_traverse(visitproc visit, void* arg, bool visit_top_frame) n
     // only walks the running thread's _PyCStackRef list in
     // gc_visit_thread_stacks(), so without this a collection could free an
     // object reachable only through a suspended greenlet's C-stack ref and we'd
-    // use it after free once the greenlet resumed. c_stack_ref_snapshot_len is
-    // 0 while we're the running greenlet, so this is a no-op there.
-    for (Py_ssize_t i = 0; i < this->c_stack_ref_snapshot_len; i++) {
-        Py_VISIT(this->c_stack_ref_snapshot[i]);
+    // use it after free once the greenlet resumed. The snapshot is empty while
+    // we're the running greenlet, so this is a no-op there.
+    for (const OwnedObject& ref : this->c_stack_ref_snapshot) {
+        Py_VISIT(ref.borrow());
     }
 #endif
     // Note that we DO NOT visit ``delete_later``. Even if it's
@@ -509,7 +469,7 @@ void PythonState::tp_clear(bool own_top_frame) noexcept
 {
     PythonStateContext::tp_clear();
 #if GREENLET_PY314 && defined(Py_GIL_DISABLED)
-    this->clear_c_stack_ref_snapshot();
+    this->c_stack_ref_snapshot.clear();
 #endif
     // If we get here owning a frame,
     // we got dealloc'd without being finished. We may or may not be
