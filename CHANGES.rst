@@ -26,6 +26,17 @@
   interpreter does when a thread detaches and reattaches. This is what caused
   Playwright's synchronous API to hang under free-threading.
 
+- Fix a potential use-after-free on free-threaded builds of Python 3.14
+  and later when the garbage collector runs while a greenlet is
+  suspended holding a ``_PyCStackRef`` (for example, mid attribute
+  resolution). Those nodes carry deferred references, and the
+  free-threaded collector only visits the running thread's list in
+  ``gc_visit_thread_stacks``, so an object reachable only through a
+  suspended greenlet's C-stack reference could be collected early and
+  used after free on resume. greenlet now snapshots those references
+  when a greenlet suspends and visits them from ``tp_traverse``. See
+  `issue 515 <https://github.com/python-greenlet/greenlet/issues/515>`_.
+
 
 3.5.3 (2026-06-26)
 ==================
