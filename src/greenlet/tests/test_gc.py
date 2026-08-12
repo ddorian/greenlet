@@ -1,5 +1,6 @@
 import gc
 
+import struct
 import weakref
 import sys
 import greenlet
@@ -105,6 +106,38 @@ class TestGC(TestCase):
             self.skipTest("Only free-threaded builds are affected")
         output = self.run_script('fail_c_stack_refs_suspended_gc.py')
         self.assertIn('C STACK REFS GC OK', output)
+
+    def _c_stack_refs_probe(self):
+        if not RUNNING_ON_FREETHREAD_BUILD or sys.version_info < (3, 14):
+            self.skipTest("Only free-threaded 3.14+ resolves the offset")
+        mod = greenlet._greenlet
+        return mod._probe_c_stack_refs_offset, mod._C_STACK_REFS_OFFSET
+
+    def test_c_stack_refs_offset_resolved(self):
+        # Issue #527: 3.14.4 appended a PyThreadState field, which moved
+        # _PyThreadStateImpl.c_stack_refs by 8 bytes inside a released series. A
+        # wheel built against one 3.14.x read the wrong word on another and
+        # segfaulted on the first switch, so we ask the interpreter where the
+        # field is rather than trusting offsetof().
+        _, offset = self._c_stack_refs_probe()
+        self.assertGreater(offset, 0)
+        self.assertEqual(offset % struct.calcsize('P'), 0)
+
+    def test_c_stack_refs_offset_survives_a_wrong_start(self):
+        # The regression this guards: a build whose compile-time offsetof() is
+        # off by a pointer or two still finds the real field.
+        probe, offset = self._c_stack_refs_probe()
+        for bias in (-24, -16, -8, 0, 8, 16, 24):
+            self.assertEqual(probe(offset + bias), offset, bias)
+
+    def test_c_stack_refs_offset_admits_defeat(self):
+        # Out of range it reports 0 instead of guessing, which is what turns an
+        # unrecognized layout into an ImportError rather than a crash.
+        probe, offset = self._c_stack_refs_probe()
+        self.assertEqual(probe(offset + 200), 0)
+        self.assertEqual(probe(0), 0)
+        with self.assertRaises(ValueError):
+            probe(-1)
 
     def test_crashing_deferred_object(self):
         if sys.version_info < (3, 15):

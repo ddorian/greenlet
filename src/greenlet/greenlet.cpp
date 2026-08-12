@@ -219,6 +219,13 @@ greenlet_internal_mod_init() noexcept
         mod_globs = new greenlet::GreenletGlobals;
         ThreadState::init();
 
+#if GREENLET_PY314 && defined(Py_GIL_DISABLED)
+        // Before any switch can read it.
+        Require(greenlet::resolve_c_stack_refs_offset());
+        m.PyAddObject("_C_STACK_REFS_OFFSET",
+                      (long)greenlet::c_stack_refs_offset);
+#endif
+
         m.PyAddObject("greenlet", PyGreenlet_Type);
         m.PyAddObject("UnswitchableGreenlet", PyGreenletUnswitchable_Type);
         m.PyAddObject("error", mod_globs->PyExc_GreenletError);

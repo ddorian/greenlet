@@ -5,7 +5,15 @@
 3.5.6 (unreleased)
 ==================
 
-- Nothing changed yet.
+- Fix a crash (segfault) on the first greenlet switch on free-threaded
+  builds of Python 3.14.0 through 3.14.3. Python 3.14.4 changed the
+  layout of an internal structure that greenlet reads, so wheels built
+  for one 3.14.x looked in the wrong place on another. greenlet now
+  locates that field in the running interpreter rather than assuming the
+  layout it was compiled against, and refuses to import with a clear
+  error if it cannot. Reported by Federico Caselli in `issue 515
+  <https://github.com/python-greenlet/greenlet/issues/515>`_. See `issue
+  527 <https://github.com/python-greenlet/greenlet/issues/527>`_.
 
 
 3.5.5 (2026-08-10)

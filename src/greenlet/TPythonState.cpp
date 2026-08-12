@@ -2,6 +2,8 @@
 #define GREENLET_PYTHON_STATE_CPP
 
 #include <Python.h>
+#include <cstddef>
+#include <cstring>
 #include "TGreenlet.hpp"
 
 namespace greenlet {
@@ -93,20 +95,167 @@ PythonState::PythonState()
 }
 
 #if GREENLET_PY314 && defined(Py_GIL_DISABLED)
+
+size_t c_stack_refs_offset = offsetof(_PyThreadStateImpl, c_stack_refs);
+
+namespace {
+
+// Shared with probe_descr_get() for the duration of one probe. Probing happens
+// at import, and from one test, so it does not need to be re-entrant.
+uintptr_t probe_stack_top = 0;
+size_t probe_start = 0;
+size_t probe_found = 0;
+int probe_hits = 0;
+
+// How far either side of probe_start to look, in pointer-sized steps.
+const int PROBE_STEPS = 8;
+
+// And how far probe_start itself may sit from where we were compiled to expect
+// the field. There are over 14000 bytes of _PyThreadStateImpl past c_stack_refs
+// in every layout we know of, so this keeps every read inside the allocation.
+const size_t PROBE_MAX_DRIFT = 256;
+
+PyObject*
+probe_descr_get(PyObject* self, PyObject* UNUSED(obj), PyObject* UNUSED(type))
+{
+    // _PyObject_GenericGetAttrWithDict resolved us through a _PyCStackRef
+    // holding ``self``, and that node is on its frame, between us and
+    // probe_stack_top. Whichever word of the thread state points at it is
+    // c_stack_refs. Comparing against a private object we just built means a
+    // near miss cannot pass for a hit.
+    char here;
+    const char* const base = reinterpret_cast<const char*>(PyThreadState_GET());
+    const uintptr_t low = reinterpret_cast<uintptr_t>(&here);
+
+    for (int step = -PROBE_STEPS; step <= PROBE_STEPS; step++) {
+        const size_t offset = static_cast<size_t>(
+            static_cast<ptrdiff_t>(probe_start) + step * (ptrdiff_t)sizeof(void*));
+        uintptr_t value;
+        memcpy(&value, base + offset, sizeof(value));
+        // Everything from &here up to probe_stack_top is our own live stack, so
+        // this bound is what makes the dereference below safe.
+        if (value <= low || value >= probe_stack_top || value % sizeof(void*)) {
+            continue;
+        }
+        const _PyCStackRef* const node = reinterpret_cast<const _PyCStackRef*>(value);
+        if (PyStackRef_IsNullOrInt(node->ref)
+            || PyStackRef_AsPyObjectBorrow(node->ref) != self) {
+            continue;
+        }
+        probe_found = offset;
+        probe_hits++;
+    }
+    Py_RETURN_NONE;
+}
+
+int
+probe_descr_set(PyObject* UNUSED(self), PyObject* UNUSED(obj), PyObject* UNUSED(value))
+{
+    // Never called. It exists so PyDescr_IsData() is true and generic getattr
+    // takes its first branch, which calls us with the _PyCStackRef still held.
+    return 0;
+}
+
+PyType_Slot probe_slots[] = {
+    {Py_tp_descr_get, (void*)probe_descr_get},
+    {Py_tp_descr_set, (void*)probe_descr_set},
+    {0, nullptr},
+};
+
+PyType_Spec probe_spec = {
+    "greenlet._greenlet._c_stack_refs_probe",
+    sizeof(PyObject),
+    0,
+    Py_TPFLAGS_DEFAULT,
+    probe_slots,
+};
+
+} // namespace
+
+size_t
+probe_c_stack_refs_offset(size_t start) noexcept
+{
+    char outer;
+    const size_t expected = offsetof(_PyThreadStateImpl, c_stack_refs);
+    if (start < PROBE_STEPS * sizeof(void*)
+        || start + PROBE_MAX_DRIFT < expected
+        || start > expected + PROBE_MAX_DRIFT) {
+        return 0;
+    }
+
+    // descr on a throwaway class, then read it back: type(o).attr.__get__ runs
+    // inside the lookup that holds the _PyCStackRef we are hunting for.
+    const OwnedObject descr_type = OwnedObject::consuming(PyType_FromSpec(&probe_spec));
+    const OwnedObject descr = descr_type
+        ? OwnedObject::consuming(PyObject_CallNoArgs(descr_type.borrow()))
+        : OwnedObject();
+    const OwnedObject attrs = OwnedObject::consuming(PyDict_New());
+    if (!descr || !attrs
+        || PyDict_SetItemString(attrs.borrow(), "attr", descr.borrow()) < 0) {
+        PyErr_Clear();
+        return 0;
+    }
+    const OwnedObject holder_type = OwnedObject::consuming(
+        PyObject_CallFunction((PyObject*)&PyType_Type, "s()O",
+                              "greenlet_probe", attrs.borrow()));
+    const OwnedObject holder = holder_type
+        ? OwnedObject::consuming(PyObject_CallNoArgs(holder_type.borrow()))
+        : OwnedObject();
+    if (!holder) {
+        PyErr_Clear();
+        return 0;
+    }
+
+    probe_stack_top = reinterpret_cast<uintptr_t>(&outer);
+    probe_start = start;
+    probe_found = 0;
+    probe_hits = 0;
+    const OwnedObject got = OwnedObject::consuming(
+        PyObject_GetAttrString(holder.borrow(), "attr"));
+    if (!got) {
+        PyErr_Clear();
+        return 0;
+    }
+    // More than one candidate word means we cannot tell which is real.
+    return probe_hits == 1 ? probe_found : 0;
+}
+
+int
+resolve_c_stack_refs_offset() noexcept
+{
+    const size_t found = probe_c_stack_refs_offset(c_stack_refs_offset);
+    if (found) {
+        c_stack_refs_offset = found;
+        return 0;
+    }
+    if (Py_Version == PY_VERSION_HEX) {
+        // Built against exactly this interpreter, so offsetof() holds.
+        return 0;
+    }
+    PyErr_Format(PyExc_ImportError,
+                 "greenlet was built for Python %d.%d.%d but is running on "
+                 "%d.%d.%d, and could not locate c_stack_refs. Rebuild greenlet "
+                 "for this interpreter.",
+                 PY_MAJOR_VERSION, PY_MINOR_VERSION, PY_MICRO_VERSION,
+                 (int)((Py_Version >> 24) & 0xFF),
+                 (int)((Py_Version >> 16) & 0xFF),
+                 (int)((Py_Version >> 8) & 0xFF));
+    return -1;
+}
+
 void PythonState::capture_c_stack_refs(const PyThreadState* tstate) noexcept
 {
-    // Runs from operator<< while our C stack is still live and coherent, so we
-    // can walk tstate's _PyCStackRef list and take a strong reference to every
-    // object it holds. tp_traverse visits these once we're suspended, because
-    // by then the nodes themselves have been relocated into the heap stack copy
-    // and the saved list head no longer points at them. Strong references (not
-    // _Py_VISIT_STACKREF, whose _PyGC_VisitStackRef isn't exported before 3.15);
-    // a std::vector rather than a Python list/tuple because operator<< must not
-    // allocate a GC-tracked object mid-switch. Rebuilt from scratch each time;
-    // the list is empty at a typical switch, so this is usually just an empty
-    // loop.
+    // Runs from operator<< while our C stack is still live, so we can walk
+    // tstate's _PyCStackRef list and take a strong reference to everything it
+    // holds. tp_traverse visits those once we're suspended, by which point the
+    // nodes have moved into the heap stack copy and the saved head no longer
+    // points at them. Strong references rather than _Py_VISIT_STACKREF because
+    // _PyGC_VisitStackRef is not exported before 3.15, and a std::vector rather
+    // than a Python container because operator<< must not allocate a GC-tracked
+    // object mid-switch. Usually an empty loop; the list is empty at a typical
+    // switch.
     this->c_stack_ref_snapshot.clear();
-    for (const _PyCStackRef* node = ((_PyThreadStateImpl*)tstate)->c_stack_refs;
+    for (const _PyCStackRef* node = *c_stack_refs_of(tstate);
          node != nullptr; node = node->next) {
         if (!PyStackRef_IsNullOrInt(node->ref)) {
             this->c_stack_ref_snapshot.push_back(
@@ -168,7 +317,7 @@ void PythonState::operator<<(const PyThreadState *const tstate) noexcept
     this->py_recursion_depth = tstate->py_recursion_limit - tstate->py_recursion_remaining;
     this->current_executor = tstate->current_executor;
     #ifdef Py_GIL_DISABLED
-    this->c_stack_refs = ((_PyThreadStateImpl*)tstate)->c_stack_refs;
+    this->c_stack_refs = *c_stack_refs_of(tstate);
     // Capture the deferred references now, while our C stack is still live, so
     // tp_traverse can keep them from being collected while we're suspended.
     this->capture_c_stack_refs(tstate);
@@ -291,7 +440,7 @@ void PythonState::operator>>(PyThreadState *const tstate) noexcept
     tstate->py_recursion_remaining = tstate->py_recursion_limit - this->py_recursion_depth;
     tstate->current_executor = this->current_executor;
     #ifdef Py_GIL_DISABLED
-    ((_PyThreadStateImpl*)tstate)->c_stack_refs = this->c_stack_refs;
+    *c_stack_refs_of(tstate) = this->c_stack_refs;
     // We're the running greenlet again: our C-stack refs live in the thread
     // state now and gc_visit_thread_stacks() covers them, so drop the strong
     // references tp_traverse held on our behalf while we were suspended.

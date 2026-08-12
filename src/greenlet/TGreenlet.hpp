@@ -113,6 +113,30 @@ namespace greenlet
             tstate->context_ver++;
         }
     };
+#if GREENLET_PY314 && defined(Py_GIL_DISABLED)
+    // Byte offset of _PyThreadStateImpl::c_stack_refs in the interpreter we are
+    // running on. Our compile-time offsetof() is only right if that interpreter
+    // has the same PyThreadState layout as the headers we were built against,
+    // and 3.14.4 broke that inside a released series by appending
+    // PyThreadState::datastack_cached_chunk: one cp314t wheel has to serve every
+    // 3.14.x. See https://github.com/python-greenlet/greenlet/issues/527.
+    extern size_t c_stack_refs_offset;
+
+    // Get CPython to tell us where it keeps c_stack_refs, searching ``start``
+    // and the words around it. Returns 0 if it could not be pinned down.
+    size_t probe_c_stack_refs_offset(size_t start) noexcept;
+
+    // Set c_stack_refs_offset. Returns -1 with an exception set if the probe
+    // failed and we are not running on the interpreter we were built against.
+    int resolve_c_stack_refs_offset() noexcept;
+
+    static inline _PyCStackRef** c_stack_refs_of(const PyThreadState* tstate) noexcept
+    {
+        char* const base = const_cast<char*>(reinterpret_cast<const char*>(tstate));
+        return reinterpret_cast<_PyCStackRef**>(base + c_stack_refs_offset);
+    }
+#endif
+
     class SwitchingArgs;
     class PythonState : public PythonStateContext
     {

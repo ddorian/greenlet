@@ -210,7 +210,36 @@ mod_get_tstate_trash_delete_nesting(PyObject* UNUSED(module))
 
 
 
+#if GREENLET_PY314 && defined(Py_GIL_DISABLED)
+PyDoc_STRVAR(mod_probe_c_stack_refs_offset_doc,
+             "_probe_c_stack_refs_offset(start) -> int\n"
+             "\n"
+             "Testing only. Locate _PyThreadStateImpl.c_stack_refs by searching\n"
+             "``start`` and the words around it. Returns 0 if it was not found.\n");
+static PyObject*
+mod_probe_c_stack_refs_offset(PyObject* UNUSED(module), PyObject* arg)
+{
+    const Py_ssize_t start = PyLong_AsSsize_t(arg);
+    if (start < 0) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_ValueError, "start must be non-negative");
+        }
+        return NULL;
+    }
+    return PyLong_FromSize_t(
+        greenlet::probe_c_stack_refs_offset((size_t)start));
+}
+#endif
+
 static PyMethodDef GreenMethods[] = {
+#if GREENLET_PY314 && defined(Py_GIL_DISABLED)
+    {
+      .ml_name="_probe_c_stack_refs_offset",
+      .ml_meth=(PyCFunction)mod_probe_c_stack_refs_offset,
+      .ml_flags=METH_O,
+      .ml_doc=mod_probe_c_stack_refs_offset_doc
+    },
+#endif
     {
       .ml_name="getcurrent",
       .ml_meth=(PyCFunction)mod_getcurrent,
